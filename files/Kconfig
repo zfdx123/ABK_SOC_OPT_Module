@@ -2,20 +2,17 @@
 #
 # ABK SoC Power Optimization
 #
-
 config ABK_SOC_OPT
 	tristate "ABK SoC power optimization"
 	depends on CPU_FREQ
 	default m
 	help
-	  Kernel-side SoC power optimization module.
-	  Uses cpufreq policy notifier to enforce per-cluster
+	  Kernel-side cpufreq capping module.
+	  Uses a cpufreq policy notifier to enforce per-cluster
 	  frequency limits, preventing userspace daemons (perfd,
 	  thermal-engine) from overriding them.
 
-	  Sysfs control interface at /sys/kernel/abk_soc_opt/
-
-	  Works together with the AppOpt userspace tool for
-	  Snapdragon 8 Gen 3 and similar SoCs.
+	  Sysfs control at /sys/kernel/abk_soc_opt/
+	  Works with the AppOpt userspace tool.
 
 	  To compile as a module, choose M here.
