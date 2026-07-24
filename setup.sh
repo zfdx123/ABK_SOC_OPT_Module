@@ -18,47 +18,71 @@ abk_log "version: ${ABK_MODULE_VERSION:-unknown}"
 abk_log "stage: $CUSTOM_EXTERNAL_MODULE_STAGE"
 abk_log "kernel root: $KERNEL_ROOT"
 
-KERNEL_DRIVER_DIR="$KERNEL_ROOT/drivers/soc/abk_soc_opt"
-KERNEL_SOC_KCONFIG="$KERNEL_ROOT/drivers/soc/Kconfig"
-KERNEL_SOC_MAKEFILE="$KERNEL_ROOT/drivers/soc/Makefile"
+# ------------------------------------------------------------------
+# 工具函数
+# ------------------------------------------------------------------
+
+soc_opt_common_dir() {
+  abk_common_dir
+}
+
+soc_opt_copy_tree() {
+  local src="$1" dst="$2"
+  abk_require_dir "$src"
+  mkdir -p "$dst"
+  cp -a "$src"/. "$dst"/
+  abk_log "synced $src -> $dst"
+}
+
+# ------------------------------------------------------------------
+# 内核树注入
+# ------------------------------------------------------------------
+
+soc_opt_install_kernel_files() {
+  local common_dir drivers_dir
+
+  common_dir="$(soc_opt_common_dir)"
+  drivers_dir="$common_dir/drivers"
+
+  abk_require_dir "$drivers_dir"
+  abk_require_file "$drivers_dir/Kconfig"
+  abk_require_file "$drivers_dir/Makefile"
+
+  # 复制模块源码
+  soc_opt_copy_tree \
+    "$MODULE_DIR/files" \
+    "$drivers_dir/abk_soc_opt"
+
+  # 注册 Kconfig
+  abk_append_line_once "$drivers_dir/Kconfig" \
+    'source "drivers/abk_soc_opt/Kconfig"'
+
+  # 注册 Makefile
+  abk_append_line_once "$drivers_dir/Makefile" \
+    'obj-$(CONFIG_ABK_SOC_OPT) += abk_soc_opt/'
+
+  abk_log "kernel files installed at drivers/abk_soc_opt/"
+}
+
+soc_opt_enable_config() {
+  abk_require_file "$DEFCONFIG"
+  abk_enable_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
+  abk_log "CONFIG_ABK_SOC_OPT=y enabled in $DEFCONFIG"
+}
+
+# ------------------------------------------------------------------
+# 入口
+# ------------------------------------------------------------------
 
 case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
   after_patch)
-    # ---------------------------------------------------------------
-    # 1. 复制源码到内核树 drivers/soc/abk_soc_opt/
-    # ---------------------------------------------------------------
-    abk_log "copying source files to $KERNEL_DRIVER_DIR ..."
-    mkdir -p "$KERNEL_DRIVER_DIR"
-    cp -a "$MODULE_DIR/files/abk_soc_opt.c" "$KERNEL_DRIVER_DIR/"
-    cp -a "$MODULE_DIR/files/Kconfig"       "$KERNEL_DRIVER_DIR/"
-    cp -a "$MODULE_DIR/files/Makefile"      "$KERNEL_DRIVER_DIR/"
-    abk_log "copied: abk_soc_opt.c Kconfig Makefile"
-
-    # ---------------------------------------------------------------
-    # 2. 在 drivers/soc/Kconfig 中 source 我们的 Kconfig
-    # ---------------------------------------------------------------
-    abk_require_file "$KERNEL_SOC_KCONFIG"
-    abk_append_line_once "$KERNEL_SOC_KCONFIG" \
-      'source "drivers/soc/abk_soc_opt/Kconfig"'
-
-    # ---------------------------------------------------------------
-    # 3. 在 drivers/soc/Makefile 中注册编译目标
-    # ---------------------------------------------------------------
-    abk_require_file "$KERNEL_SOC_MAKEFILE"
-    abk_append_line_once "$KERNEL_SOC_MAKEFILE" \
-      'obj-$(CONFIG_ABK_SOC_OPT) += abk_soc_opt/'
-
-    abk_log "after_patch done — source injected at drivers/soc/abk_soc_opt/"
+    abk_log "after_patch: installing ABK SoC Opt kernel driver"
+    soc_opt_install_kernel_files
     ;;
 
   before_build)
-    # ---------------------------------------------------------------
-    # 启用 CONFIG_ABK_SOC_OPT=m
-    # ---------------------------------------------------------------
-    abk_require_file "$DEFCONFIG"
-    # abk_module_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
-    abk_enable_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
-    abk_log "before_build done — CONFIG_ABK_SOC_OPT=m enabled"
+    abk_log "before_build: enabling CONFIG_ABK_SOC_OPT=m"
+    soc_opt_enable_config
     ;;
 
   *)
