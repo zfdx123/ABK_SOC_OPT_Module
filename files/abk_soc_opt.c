@@ -23,6 +23,7 @@
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/cpumask.h>
+#include <linux/device.h>
 
 #define DRV_NAME          "abk_soc_opt"
 #define MAX_CLUSTERS      4
@@ -58,6 +59,7 @@ struct soc_cluster {
     unsigned int hw_max;
     unsigned int cap;          /* 0 = offlined */
     cpumask_var_t cpus;        /* all CPUs in this cluster */
+    bool          mask_allocated;
     bool          offlined;
 };
 
@@ -90,9 +92,8 @@ static void cluster_offline(struct soc_cluster *c)
 
     for_each_cpu(cpu, c->cpus) {
         if (cpu_online(cpu)) {
-            int ret = cpu_down(cpu);
-            if (ret)
-                pr_err(DRV_NAME ": cpu%d down failed (%d)\n", cpu, ret);
+            struct device *dev = get_cpu_device(cpu);
+            if (dev) { device_offline(dev); }
         }
     }
     c->offlined = true;
@@ -110,9 +111,8 @@ static void cluster_online(struct soc_cluster *c)
 
     for_each_cpu(cpu, c->cpus) {
         if (!cpu_online(cpu)) {
-            int ret = cpu_up(cpu);
-            if (ret)
-                pr_err(DRV_NAME ": cpu%d up failed (%d)\n", cpu, ret);
+            struct device *dev = get_cpu_device(cpu);
+            if (dev) { device_online(dev); }
         }
     }
     c->offlined = false;
@@ -243,11 +243,12 @@ static void soc_scan_and_apply(void)
         }
 
         /* 分配并拷贝 CPU 掩码 */
-        if (!clusters[idx].cpus) {
+        if (!clusters[idx].mask_allocated) {
             if (!zalloc_cpumask_var(&clusters[idx].cpus, GFP_KERNEL)) {
                 cpufreq_cpu_put(policy);
                 break;
             }
+            clusters[idx].mask_allocated = true;
         }
         cpumask_copy(clusters[idx].cpus, policy->related_cpus);
 
@@ -425,7 +426,7 @@ static void restore_all_clusters(void)
             cpufreq_cpu_put(policy);
         }
 
-        if (clusters[i].cpus)
+        if (clusters[i].mask_allocated)
             free_cpumask_var(clusters[i].cpus);
     }
 }
