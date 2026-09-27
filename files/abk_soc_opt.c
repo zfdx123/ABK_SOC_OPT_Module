@@ -171,7 +171,7 @@ static void cluster_offline(struct soc_cluster *c)
      * 而且卸载时再 remove 会触发 WARN（request 已不活跃）。 */
     cluster_set_qos(c, 0);
 
-    for_each_cpu(cpu, c->cpus) {
+    for_each_cpu(cpu, &c->cpus) {
         /* CPU0 不能被下线，内核会拒绝；显式跳过避免刷警告 */
         if (cpu == 0)
             continue;
@@ -191,7 +191,7 @@ static void cluster_online(struct soc_cluster *c)
     if (!c->offlined)
         return;
 
-    for_each_cpu(cpu, c->cpus) {
+    for_each_cpu(cpu, &c->cpus) {
         if (!cpu_online(cpu))
             add_cpu(cpu);
     }
