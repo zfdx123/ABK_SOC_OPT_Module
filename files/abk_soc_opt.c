@@ -192,10 +192,16 @@ static struct delayed_work arm_watchdog_work;
 /* 重新 arm 的节流：防抖，避免用户态高频写 arm 反复触发扫描 */
 #define ARM_REARM_THROTTLE_MS   1000
 
+/* 前向声明。
+ * 注意 arm_watchdog_start：它被 arm_enable() 调用，但定义在其后，
+ * 漏了声明会报 "call to undeclared function"（C99 起不再允许隐式声明）。 */
 static void soc_scan_and_apply(void);
 static void restore_all_clusters(void);
 static void poll_start(void);
 static void poll_stop(void);
+static void arm_watchdog_start(void);
+static void arm_enable(void);
+static void arm_disable(void);
 
 /* 进程是否还活着。用 get_pid_task 拿引用再立刻归还，
  * 避免 pid 复用导致的误判。 */
@@ -559,8 +565,6 @@ static void poll_stop(void)
 /* ========================================================================
  * 初始化扫描
  * ===================================================================== */
-
-static void soc_scan_and_apply(void);
 
 /* 扫描重试: arm 之后 cpufreq 驱动可能还没就绪（builtin 场景）。
  * 用 delayed_work 而不是在 notifier 里直接调 cpufreq_cpu_get(),
