@@ -1,7 +1,20 @@
 /*
- * abk_soc_opt.c — ABK SoC 功耗优化内核模块 v2.3
+ * abk_soc_opt.c — ABK SoC 功耗优化内核模块 v2.4
  *
  * 内核态 cpufreq policy notifier，拦截用户空间频率修改并强制锁定上限。
+ *
+ * v2.4 编译修复 (v2.3 编成 .ko 时 modpost 报 undefined):
+ *   - device_offline()/device_online() 在 v6.1 里没有 EXPORT_SYMBOL。
+ *     改用 EXPORT_SYMBOL_GPL 导出的 add_cpu()/remove_cpu() —— 内核源码
+ *     明确写着 "Other subsystems should use remove_cpu()/add_cpu() instead"。
+ *     实现上 remove_cpu() 内部就是 lock_device_hotplug()+device_offline()，
+ *     行为完全一致，只是由它自己持锁。
+ *   - cpumask_var_t 换成内嵌 cpumask_t。alloc/free_cpumask_var 的 EXPORT
+ *     只在 CONFIG_CPUMASK_OFFSTACK=y 时才存在（lib/cpumask.c 整段被
+ *     #ifdef 包住），换构建配置就会重现同类报错。内嵌写法还顺带消除了
+ *     "扫描提前失败导致 cpumask 泄漏"的问题。
+ *   设备实测确认: CONFIG_HOTPLUG_CPU=y / CONFIG_SMP=y，
+ *   __ksymtab_remove_cpu、__ksymtab_add_cpu 均存在。
  *
  * v2.3 关键修复:
  *   [致命] 初始化时序: 原实现在 device_initcall 级别扫描 cluster，而
@@ -42,7 +55,6 @@
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/cpumask.h>
-#include <linux/device.h>
 #include <linux/pm_qos.h>
 #include <linux/atomic.h>
 
@@ -79,8 +91,18 @@ struct soc_cluster {
     unsigned int first_cpu;
     unsigned int hw_max;
     unsigned int cap;          /* 0 = offlined */
-    cpumask_var_t cpus;        /* all CPUs in this cluster */
-    bool          mask_allocated;
+
+    /* 内嵌 cpumask，不用 cpumask_var_t。
+     *
+     * cpumask_var_t + alloc_cpumask_var_node()/free_cpumask_var() 只在
+     * CONFIG_CPUMASK_OFFSTACK=y 时才是真正的导出函数（lib/cpumask.c 里
+     * 整段被 #ifdef 包住）。本机该配置为 n，虽然宏会退化成 nop 从而"碰巧
+     * 能编译"，但一旦换构建配置打开 OFFSTACK 就会立刻报
+     *   modpost: "free_cpumask_var" ... undefined!
+     * 而 MAX_CLUSTERS 只有 4，内嵌 4 个 cpumask 的代价可以忽略。
+     * 内嵌写法还能顺带消除原来"扫描提前失败导致 cpumask 泄漏"的问题。 */
+    cpumask_t     cpus;
+
     bool          offlined;
 
     /* freq_qos 约束: 把上限钉在 cpufreq 的 QoS 层。
@@ -118,7 +140,19 @@ static int scan_retry_count;
 static void cluster_set_qos(struct soc_cluster *c, unsigned int cap_khz);
 static int  cluster_add_qos(struct soc_cluster *c, unsigned int cap_khz);
 
-/* 下线一个 cluster 的全部核心。首次调用时若 CPU 不存在则静默跳过。 */
+/* 下线一个 cluster 的全部核心。首次调用时若 CPU 不存在则静默跳过。
+ *
+ * 用 add_cpu()/remove_cpu() 而不是直接调 device_online()/device_offline():
+ * 后者在 v6.1 里没有 EXPORT_SYMBOL，编成 .ko 时 modpost 会报
+ *   "device_offline" [drivers/abk_soc_opt/abk_soc_opt.ko] undefined!
+ *   "device_online"  [drivers/abk_soc_opt/abk_soc_opt.ko] undefined!
+ * 而 add_cpu()/remove_cpu() 是 EXPORT_SYMBOL_GPL 导出的，且 kernel/cpu.c
+ * 里明确注明 "Other subsystems should use remove_cpu()/add_cpu() instead"。
+ *
+ * 实现上 remove_cpu() 内部就是 lock_device_hotplug() + device_offline()，
+ * 所以 sysfs 的 device->offline 状态同样会同步，行为与原来一致，
+ * 只是锁由它自己负责 —— 调用方不需要也不能再持 cpu_hotplug_lock。
+ */
 static void cluster_offline(struct soc_cluster *c)
 {
     int cpu;
@@ -138,10 +172,11 @@ static void cluster_offline(struct soc_cluster *c)
     cluster_set_qos(c, 0);
 
     for_each_cpu(cpu, c->cpus) {
-        if (cpu_online(cpu)) {
-            struct device *dev = get_cpu_device(cpu);
-            if (dev) { device_offline(dev); }
-        }
+        /* CPU0 不能被下线，内核会拒绝；显式跳过避免刷警告 */
+        if (cpu == 0)
+            continue;
+        if (cpu_online(cpu))
+            remove_cpu(cpu);
     }
     c->offlined = true;
     clusters_online--;
@@ -157,10 +192,8 @@ static void cluster_online(struct soc_cluster *c)
         return;
 
     for_each_cpu(cpu, c->cpus) {
-        if (!cpu_online(cpu)) {
-            struct device *dev = get_cpu_device(cpu);
-            if (dev) { device_online(dev); }
-        }
+        if (!cpu_online(cpu))
+            add_cpu(cpu);
     }
     c->offlined = false;
     clusters_online++;
@@ -397,12 +430,14 @@ static void scan_retry_start(void)
     schedule_delayed_work(&scan_retry_work, msecs_to_jiffies(SCAN_RETRY_MS));
 }
 
-/* 清空扫描状态：必须先摘掉所有 freq_qos 请求，再释放 cpumask。
+/* 清空扫描状态：必须先摘掉所有 freq_qos 请求，再清零结构体。
  *
  * 顺序很关键 —— freq_qos 请求登记在 policy->constraints 的链表里，
  * 如果先 memset 掉 clusters[]，链表里就留下指向已清零内存的悬挂节点，
  * 之后 policy 重算 / 模块卸载时移除它会踩到野指针。
- * 只有 qos_active 为 true 的请求才是"已登记"的，remove 对未登记请求会 WARN。 */
+ * 只有 qos_active 为 true 的请求才是"已登记"的，remove 对未登记请求会 WARN。
+ *
+ * cpumask 是内嵌的，随 memset 一起清零，无需单独释放。 */
 static void scan_state_reset(void)
 {
     int i;
@@ -411,12 +446,6 @@ static void scan_state_reset(void)
         if (clusters[i].qos_active) {
             freq_qos_remove_request(&clusters[i].qos_max);
             clusters[i].qos_active = false;
-        }
-    }
-    for (i = 0; i < MAX_CLUSTERS; i++) {
-        if (clusters[i].mask_allocated) {
-            free_cpumask_var(clusters[i].cpus);
-            clusters[i].mask_allocated = false;
         }
     }
     memset(clusters, 0, sizeof(clusters));
@@ -449,15 +478,8 @@ static void soc_scan_and_apply(void)
             continue;
         }
 
-        /* 分配并拷贝 CPU 掩码 */
-        if (!clusters[idx].mask_allocated) {
-            if (!zalloc_cpumask_var(&clusters[idx].cpus, GFP_KERNEL)) {
-                cpufreq_cpu_put(policy);
-                break;
-            }
-            clusters[idx].mask_allocated = true;
-        }
-        cpumask_copy(clusters[idx].cpus, policy->related_cpus);
+        /* 拷贝 CPU 掩码（内嵌 cpumask，已在 scan_state_reset 里清零） */
+        cpumask_copy(&clusters[idx].cpus, policy->related_cpus);
 
         clusters[idx].first_cpu = cpu;
         clusters[idx].hw_max    = policy->cpuinfo.max_freq;
@@ -682,8 +704,9 @@ static void restore_all_clusters(void)
     int i;
 
     /* 遍历 MAX_CLUSTERS 而不是 num_clusters:
-     * 扫描提前失败时 num_clusters 可能是 0，但前面的槽位已经分配了 cpumask，
-     * 只按 num_clusters 遍历会漏掉它们（cpumask 泄漏）。 */
+     * 扫描可能提前失败使 num_clusters=0，但前面的槽位仍持有 QoS 约束，
+     * 只按 num_clusters 遍历会漏掉它们。
+     * cpumask 是内嵌的，不需要释放。 */
     for (i = 0; i < MAX_CLUSTERS; i++) {
         if (clusters[i].qos_active) {
             freq_qos_remove_request(&clusters[i].qos_max);
@@ -693,7 +716,8 @@ static void restore_all_clusters(void)
         if (clusters[i].offlined)
             cluster_online(&clusters[i]);
 
-        if (clusters[i].first_cpu || clusters[i].mask_allocated) {
+        /* 恢复被我们压下去的频率上限 */
+        if (clusters[i].hw_max > 0) {
             struct cpufreq_policy *policy =
                 cpufreq_cpu_get(clusters[i].first_cpu);
             if (policy) {
@@ -702,12 +726,9 @@ static void restore_all_clusters(void)
                 cpufreq_cpu_put(policy);
             }
         }
-
-        if (clusters[i].mask_allocated) {
-            free_cpumask_var(clusters[i].cpus);
-            clusters[i].mask_allocated = false;
-        }
     }
+    memset(clusters, 0, sizeof(clusters));
+    clusters_online = 0;
     num_clusters = 0;
 }
 
@@ -715,7 +736,7 @@ static int __init abk_soc_opt_init(void)
 {
     int ret;
 
-    pr_info(DRV_NAME ": loading v2.3\n");
+    pr_info(DRV_NAME ": loading v2.4\n");
 
     mutex_init(&lock);
 
@@ -775,4 +796,4 @@ module_exit(abk_soc_opt_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AppOpt");
 MODULE_DESCRIPTION("ABK SoC power optimization — cpufreq cap + core offlining + polling");
-MODULE_VERSION("2.3");
+MODULE_VERSION("2.4");
