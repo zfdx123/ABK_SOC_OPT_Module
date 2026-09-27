@@ -1,7 +1,31 @@
 /*
- * abk_soc_opt.c — ABK SoC 功耗优化内核模块 v2.4
+ * abk_soc_opt.c — ABK SoC 功耗优化内核模块 v2.5
  *
  * 内核态 cpufreq policy notifier，拦截用户空间频率修改并强制锁定上限。
+ *
+ * v2.5 用户态门控 (userspace-gated):
+ *   核心变化: 内核态默认【完全不生效】，必须由用户态显式 arm 才开始工作；
+ *   用户态一旦消失，看门狗自动收起全部约束。
+ *
+ *   动机: 避免"内核态在跑但用户态没了"造成的半生效状态 —— 那种状态下
+ *   内核会单方面压频率、离线核心，而没有任何东西负责恢复或协调。
+ *
+ *   接口:
+ *     echo <pid> > /sys/kernel/abk_soc_opt/arm   启用，以该 pid 为持有者
+ *     echo 0     > /sys/kernel/abk_soc_opt/arm   主动收起
+ *     重复写同一 pid 即续期心跳（开销为零）
+ *     cat /sys/kernel/abk_soc_opt/active         内核态当前是否真的在施加约束
+ *     cat /sys/kernel/abk_soc_opt/armed_pid      当前持有者 pid
+ *
+ *   失效条件（任一满足即自动 disarm 并恢复中性状态）:
+ *     - 持有者进程退出（通过 get_pid_task 判断，不受 pid 复用影响）
+ *     - arm_timeout_ms 内未续期心跳（默认 30000ms，设 0 关闭看门狗）
+ *     - 用户态主动写 0
+ *     - enabled=0（模块参数或 sysfs）
+ *
+ *   副作用（正面）: 扫描改为懒执行 —— 只有 arm 时才扫 cluster，
+ *   那时 cpufreq 驱动必然已就绪，"本模块 init 早于 qcom-cpufreq-hw"的
+ *   builtin 时序问题从根上消失，不再需要靠重试去补。
  *
  * v2.4 编译修复 (v2.3 编成 .ko 时 modpost 报 undefined):
  *   - device_offline()/device_online() 在 v6.1 里没有 EXPORT_SYMBOL。
@@ -124,6 +148,36 @@ static atomic_t           nb_depth = ATOMIC_INIT(0);
 /* 扫描只做一次，失败则重试 */
 static atomic_t           scan_done = ATOMIC_INIT(0);
 
+/* ========================================================================
+ * 用户态持有 (arming) —— 只有用户态在跑，内核态才生效
+ * =====================================================================
+ *
+ * 设计目标:
+ *   1. 内核态默认【完全不生效】。加载/内建进来只是注册接口，不扫 cluster、
+ *      不装 QoS、不碰任何频率。
+ *   2. 用户态写完 arm 之后才生效；用户态一死（崩溃/被杀/超时未续期），
+ *      看门狗自动收起全部约束，回到中性状态。
+ *   3. 这样"内核态在跑但用户态没了"造成的半生效状态在结构上不可能出现。
+ *
+ * 持有方式用 PID + 心跳超时，不用 fd 持有:
+ *   fd 持有（char 设备 + release 回调）语义上更精确，但需要额外的设备节点
+ *   和 SELinux 标签，跨机型风险高；PID + 心跳只需 sysfs，且用户态用
+ *   AppOpt 的现有主循环续期即可，零额外依赖。
+ *
+ *   arm 语义:  echo <pid> > /sys/kernel/abk_soc_opt/arm   启用并以该 pid 为持有者
+ *              echo 0     > /sys/kernel/abk_soc_opt/arm   主动收起
+ */
+static pid_t  armed_pid;
+static unsigned long armed_last_jiffies;
+static bool   enforced;              /* 当前是否已施加约束 */
+
+/* 心跳超时(毫秒)。0 = 不启用看门狗，纯手动 arm/disarm。
+ * 用户态需在此时间内至少续期一次，否则内核自动 disarm。 */
+static unsigned int arm_timeout_ms = 30000;
+module_param(arm_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(arm_timeout_ms,
+    "Userspace heartbeat timeout in ms (0=no watchdog, default 30000)");
+
 /* polling */
 static struct delayed_work poll_work;
 /* 扫描重试 */
@@ -131,6 +185,118 @@ static struct delayed_work scan_retry_work;
 #define SCAN_RETRY_MAX   60
 #define SCAN_RETRY_MS    500
 static int scan_retry_count;
+
+/* 持有者看门狗 */
+static struct delayed_work arm_watchdog_work;
+#define ARM_WATCHDOG_PERIOD_MS  2000
+/* 重新 arm 的节流：防抖，避免用户态高频写 arm 反复触发扫描 */
+#define ARM_REARM_THROTTLE_MS   1000
+
+static void soc_scan_and_apply(void);
+static void restore_all_clusters(void);
+static void poll_start(void);
+static void poll_stop(void);
+
+/* 进程是否还活着。用 get_pid_task 拿引用再立刻归还，
+ * 避免 pid 复用导致的误判。 */
+static bool arm_owner_alive(void)
+{
+    struct task_struct *t;
+    bool alive;
+
+    if (!armed_pid)
+        return false;
+
+    rcu_read_lock();
+    t = get_pid_task(find_vpid(armed_pid), PIDTYPE_PID);
+    rcu_read_unlock();
+    if (!t)
+        return false;
+
+    alive = (READ_ONCE(t->__state) != TASK_DEAD);
+    put_task_struct(t);
+    return alive;
+}
+
+/* 收起全部约束，回到中性状态 */
+static void arm_disable(void)
+{
+    if (!enforced)
+        return;
+
+    poll_stop();
+    cancel_delayed_work_sync(&scan_retry_work);
+    restore_all_clusters();      /* 摘 QoS、恢复频率上限、把离线的核放回来 */
+    enforced = false;
+    pr_info(DRV_NAME ": disarmed, all constraints released\n");
+}
+
+/* 施加约束。可重入：已生效时直接返回。 */
+static void arm_enable(void)
+{
+    if (enforced)
+        return;
+
+    soc_scan_and_apply();
+
+    if (num_clusters == 0) {
+        /* cpufreq 还没就绪，启动重试；真正生效交给 scan_retry_cb */
+        pr_info(DRV_NAME ": armed but cpufreq not ready, retrying\n");
+        scan_retry_count = 0;
+        schedule_delayed_work(&scan_retry_work, msecs_to_jiffies(SCAN_RETRY_MS));
+        return;
+    }
+
+    atomic_set(&scan_done, 1);
+    poll_start();
+    enforced = true;
+    arm_watchdog_start();
+    pr_info(DRV_NAME ": armed by pid %d, %d clusters enforcing\n",
+            armed_pid, num_clusters);
+}
+
+/* 看门狗：持有者死了或超时未续期就自动收起 */
+static void arm_watchdog_cb(struct work_struct *work)
+{
+    bool timeout = false;
+
+    if (arm_timeout_ms > 0) {
+        unsigned long deadline =
+            armed_last_jiffies + msecs_to_jiffies(arm_timeout_ms) / 2;
+        timeout = time_after(jiffies, deadline);
+    }
+
+    if (!armed_pid || timeout || !arm_owner_alive()) {
+        if (armed_pid) {
+            pr_warn(DRV_NAME ": owner gone (pid=%d timeout=%d alive=%d), disarming\n",
+                    armed_pid, (int)timeout, (int)arm_owner_alive());
+            armed_pid = 0;
+            arm_disable();
+        }
+        return;   /* 已收起，不再重排 */
+    }
+
+    schedule_delayed_work(&arm_watchdog_work,
+                          msecs_to_jiffies(ARM_WATCHDOG_PERIOD_MS));
+}
+
+static void arm_watchdog_start(void)
+{
+    schedule_delayed_work(&arm_watchdog_work,
+                          msecs_to_jiffies(ARM_WATCHDOG_PERIOD_MS));
+}
+
+/* 统一的开关入口：sysfs 和模块参数都走这里，保证语义一致 */
+static void soc_set_enabled(int val)
+{
+    enabled = !!val;
+
+    if (enabled && armed_pid) {
+        arm_enable();
+    } else if (!enabled) {
+        arm_disable();
+    }
+}
 
 /* ========================================================================
  * 核心下线/上线
@@ -328,14 +494,15 @@ static int soc_cpufreq_notify(struct notifier_block *nb,
     struct cpufreq_policy *policy = data;
     int i;
 
-    if (!enabled)
+    /* 未生效时内核态必须完全不干预。这是"只有用户态在跑内核态才生效"
+     * 的关键闸门：没有持有者就一路返回，不碰 policy、不改频率。 */
+    if (!enabled || !enforced)
         return NOTIFY_DONE;
 
     if (action == CPUFREQ_CREATE_POLICY ||
         action == CPUFREQ_REMOVE_POLICY) {
-        /* 首次创建 policy 时，说明 cpufreq 驱动终于就绪了。
-         * 如果启动时扫描失败（num_clusters==0），这是一个绝佳的补扫时机 ——
-         * 正是这个时序问题让旧版本永久失效。 */
+        /* 已 arm 但在等 cpufreq 就绪时，借 CREATE_POLICY 触发补扫。
+         * （v2.5 改为懒扫描后这种情况只会在 arm 后驱动尚未就绪时出现） */
         if (action == CPUFREQ_CREATE_POLICY && atomic_read(&scan_done) == 0)
             schedule_delayed_work(&scan_retry_work, 0);
         return NOTIFY_DONE;
@@ -395,18 +562,24 @@ static void poll_stop(void)
 
 static void soc_scan_and_apply(void);
 
-/* 扫描重试: 解决"本模块比 qcom-cpufreq-hw 更早 init"的时序问题。
+/* 扫描重试: arm 之后 cpufreq 驱动可能还没就绪（builtin 场景）。
  * 用 delayed_work 而不是在 notifier 里直接调 cpufreq_cpu_get(),
- * 避免在持有 policy->rwsem 时再去拿 cpufreq_driver_lock。 */
+ * 避免在持有 policy->rwsem 时再去拿 cpufreq_driver_lock。
+ *
+ * 注意: 每次重试前都要检查是否仍处于 arm 状态 —— 持有者可能在重试期间
+ * 就退出了，这时必须立刻放弃，不能"复活"约束。 */
 static void scan_retry_cb(struct work_struct *work)
 {
-    if (num_clusters > 0) {
-        atomic_set(&scan_done, 1);
+    if (enforced || !armed_pid) {
+        /* 已生效，或持有者已消失：收工 */
         return;
     }
+
     if (scan_retry_count >= SCAN_RETRY_MAX) {
         pr_warn(DRV_NAME ": giving up cluster scan after %d retries "
                          "(cpufreq driver never became ready)\n", scan_retry_count);
+        armed_pid = 0;
+        arm_disable();
         return;
     }
 
@@ -414,20 +587,13 @@ static void scan_retry_cb(struct work_struct *work)
     soc_scan_and_apply();
 
     if (num_clusters > 0) {
-        atomic_set(&scan_done, 1);
         pr_info(DRV_NAME ": cluster scan succeeded on retry %d\n", scan_retry_count);
-        enforce_all();
-        /* 扫描成功后再按需启动轮询 */
-        poll_start();
+        /* 交给统一入口置位 enforced / 起轮询 / 起看门狗，
+         * 避免这里漏掉状态变更（曾导致 enforced 永远起不来）。 */
+        arm_enable();
     } else {
         schedule_delayed_work(&scan_retry_work, msecs_to_jiffies(SCAN_RETRY_MS));
     }
-}
-
-static void scan_retry_start(void)
-{
-    scan_retry_count = 0;
-    schedule_delayed_work(&scan_retry_work, msecs_to_jiffies(SCAN_RETRY_MS));
 }
 
 /* 清空扫描状态：必须先摘掉所有 freq_qos 请求，再清零结构体。
@@ -549,12 +715,73 @@ static ssize_t enabled_store(struct kobject *k, struct kobj_attribute *a,
 {
     int val;
     if (kstrtoint(buf, 0, &val)) return -EINVAL;
-    enabled = !!val;
-    if (enabled)
-        enforce_all();
+    /* 走统一入口：enabled=1 也需要已有持有者才会真正生效，
+     * 避免"只翻开关但没有用户态"这种半生效状态。 */
+    soc_set_enabled(val);
     return count;
 }
 static struct kobj_attribute attr_enabled = __ATTR_RW(enabled);
+
+/* arm (wo) — 用户态持有/续期。这是内核态生效的唯一前提。
+ *
+ *   echo <pid> > arm    以该 pid 为持有者启用（重复写同一 pid 即续期心跳）
+ *   echo 0     > arm    主动收起
+ */
+static ssize_t arm_store(struct kobject *k, struct kobj_attribute *a,
+                          const char *buf, size_t count)
+{
+    pid_t pid;
+    if (kstrtoint(buf, 0, &pid)) return -EINVAL;
+
+    if (pid <= 0) {
+        armed_pid = 0;
+        arm_disable();
+        pr_info(DRV_NAME ": disarmed by userspace\n");
+        return count;
+    }
+
+    if (armed_pid != pid) {
+        /* 换持有者：先收起旧的，再按新 pid 启用 */
+        arm_disable();
+        armed_pid = 0;
+    }
+
+    armed_last_jiffies = jiffies;
+
+    if (!enabled) {
+        /* 模块参数被显式关掉了，只记录持有者不生效 */
+        pr_info(DRV_NAME ": armed by pid %d but enabled=0, not enforcing\n", pid);
+        return count;
+    }
+
+    if (!enforced) {
+        armed_pid = pid;
+        arm_enable();       /* 内部会置位 enforced、起轮询、起看门狗 */
+    } else {
+        /* 已在生效中，视作心跳续期，开销为零 */
+        armed_pid = pid;
+    }
+
+    return count;
+}
+static struct kobj_attribute attr_arm = __ATTR_WO(arm);
+
+/* armed_pid (ro) — 用户态可读回当前持有者，便于自检 */
+static ssize_t armed_pid_show(struct kobject *k, struct kobj_attribute *a,
+                               char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "%d\n", armed_pid);
+}
+static struct kobj_attribute attr_armed_pid = __ATTR_RO(armed_pid);
+
+/* active (ro) — 内核态当前是否真的在施加约束。
+ * 这是判断"内核态是否生效"的权威标志，比看 cluster_info 是否为空更直接。 */
+static ssize_t active_show(struct kobject *k, struct kobj_attribute *a,
+                            char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "%d\n", enforced ? 1 : 0);
+}
+static struct kobj_attribute attr_active = __ATTR_RO(active);
 
 /* freq_limits (rw) */
 static ssize_t freq_limits_show(struct kobject *k, struct kobj_attribute *a,
@@ -686,6 +913,9 @@ static struct kobj_attribute attr_scan = __ATTR_WO(scan);
 
 static struct attribute *soc_attrs[] = {
     &attr_enabled.attr,
+    &attr_arm.attr,
+    &attr_armed_pid.attr,
+    &attr_active.attr,
     &attr_freq_limits.attr,
     &attr_poll_ms.attr,
     &attr_cluster_info.attr,
@@ -736,7 +966,7 @@ static int __init abk_soc_opt_init(void)
 {
     int ret;
 
-    pr_info(DRV_NAME ": loading v2.4\n");
+    pr_info(DRV_NAME ": loading v2.5 (userspace-gated)\n");
 
     mutex_init(&lock);
 
@@ -748,11 +978,10 @@ static int __init abk_soc_opt_init(void)
 
     INIT_DELAYED_WORK(&poll_work, poll_timer_cb);
     INIT_DELAYED_WORK(&scan_retry_work, scan_retry_cb);
+    INIT_DELAYED_WORK(&arm_watchdog_work, arm_watchdog_cb);
 
-    /* 先注册 notifier，再扫描。
-     * 顺序很重要: 如果先扫描而 cpufreq 驱动还没就绪，我们会漏掉
-     * CPUFREQ_CREATE_POLICY 通知 —— 而那个通知正是 builtin 场景下
-     * 唯一的补救机会。 */
+    /* 只注册 notifier，不注册回调动作之外的东西。
+     * notifier 在未 arm 时会在第一行直接返回。 */
     ret = cpufreq_register_notifier(&soc_nb, CPUFREQ_POLICY_NOTIFIER);
     if (ret) {
         pr_err(DRV_NAME ": cpufreq notifier failed (%d)\n", ret);
@@ -761,20 +990,14 @@ static int __init abk_soc_opt_init(void)
         return ret;
     }
 
-    soc_scan_and_apply();
-
-    if (num_clusters > 0) {
-        atomic_set(&scan_done, 1);
-        /* 已就绪: 按需启动轮询 */
-        poll_start();
-    } else {
-        /* 时序问题: 启动重试，同时等 CPUFREQ_CREATE_POLICY 补扫 */
-        pr_info(DRV_NAME ": cpufreq not ready at init, starting retry loop\n");
-        scan_retry_start();
-    }
-
-    pr_info(DRV_NAME ": ready — %d clusters (%d online), poll=%ums, sysfs=/sys/kernel/%s/\n",
-            num_clusters, clusters_online, poll_ms, DRV_NAME);
+    /* 关键：这里【不做】任何 cluster 扫描、不装 QoS、不改频率。
+     *
+     * 之所以可以放心不扫: v2.5 的扫描改成了懒执行 —— 用户态 arm 时才扫，
+     * 那时 cpufreq 驱动必然已就绪，builtin 的 initcall 时序问题就此消失。
+     *
+     * 默认状态: 未 arm，内核态完全不生效。 */
+    pr_info(DRV_NAME ": idle — waiting for userspace arming. "
+                     "echo <pid> > /sys/kernel/%s/arm to activate\n", DRV_NAME);
     return 0;
 }
 
@@ -782,8 +1005,10 @@ static void __exit abk_soc_opt_exit(void)
 {
     poll_stop();
     cancel_delayed_work_sync(&scan_retry_work);
+    cancel_delayed_work_sync(&arm_watchdog_work);
+    arm_disable();
+
     cpufreq_unregister_notifier(&soc_nb, CPUFREQ_POLICY_NOTIFIER);
-    restore_all_clusters();
     sysfs_remove_group(soc_kobj, &soc_attr_group);
     kobject_put(soc_kobj);
 
@@ -795,5 +1020,5 @@ module_exit(abk_soc_opt_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AppOpt");
-MODULE_DESCRIPTION("ABK SoC power optimization — cpufreq cap + core offlining + polling");
-MODULE_VERSION("2.4");
+MODULE_DESCRIPTION("ABK SoC power optimization — userspace-gated cpufreq cap + core offlining");
+MODULE_VERSION("2.5");
