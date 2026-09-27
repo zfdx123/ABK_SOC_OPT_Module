@@ -66,8 +66,22 @@ soc_opt_install_kernel_files() {
 
 soc_opt_enable_config() {
   abk_require_file "$DEFCONFIG"
-  abk_enable_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
-  abk_log "CONFIG_ABK_SOC_OPT=y enabled in $DEFCONFIG"
+  # 构建模式。默认 m（可加载模块）：
+  #   =m 的 initcall 时序天然正确，且可随时 rmmod/modprobe 重新加载；
+  #   =y 会在 device_initcall 阶段运行，早于 qcom-cpufreq-hw probe，
+  #      导致扫不到 cluster（num_clusters=0）而永久失效，且无法重载补救。
+  #   v2.3 已加了扫描重试 + CPUFREQ_CREATE_POLICY 补扫 + scan sysfs 兜底，
+  #   即使 =y 也能自愈，但仍推荐 =m。
+  # 需要 builtin 时：ABK_SOC_OPT_BUILTIN=y ./setup.sh
+  local mode="m"
+  [ "${ABK_SOC_OPT_BUILTIN:-}" = "y" ] && mode="y"
+
+  if [ "$mode" = "m" ]; then
+    abk_module_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
+  else
+    abk_enable_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
+  fi
+  abk_log "CONFIG_ABK_SOC_OPT=$mode set in $DEFCONFIG"
 }
 
 # ------------------------------------------------------------------

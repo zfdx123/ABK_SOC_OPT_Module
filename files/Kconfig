@@ -15,4 +15,21 @@ config ABK_SOC_OPT
 	  Sysfs control at /sys/kernel/abk_soc_opt/
 	  Works with the AppOpt userspace tool.
 
+	  NOTE ON BUILD MODE:
+	  Prefer M (loadable module) over Y (builtin).
+
+	  Built with =y the driver runs at device_initcall time, which on
+	  Qualcomm platforms is *earlier* than qcom-cpufreq-hw finishes
+	  probing. cpufreq_cpu_get() then returns NULL for every CPU, the
+	  cluster scan records num_clusters=0, and the module stays
+	  permanently inert: the sysfs nodes exist and accept writes, but
+	  nothing is ever enforced. It cannot be recovered by reloading,
+	  because a builtin module cannot be unloaded.
+
+	  Built with =m the initcall ordering is naturally correct and the
+	  module can be reloaded at will. If you must build it in (=y), the
+	  driver now retries the scan and also rescans on the first
+	  CPUFREQ_CREATE_POLICY notification, so it should recover on its
+	  own -- but =m is still the safer choice.
+
 	  To compile as a module, choose M here.
