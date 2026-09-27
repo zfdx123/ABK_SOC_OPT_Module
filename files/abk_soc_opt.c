@@ -1,7 +1,31 @@
 /*
- * abk_soc_opt.c — ABK SoC 功耗优化内核模块 v2.5
+ * abk_soc_opt.c — ABK SoC 功耗优化内核模块 v2.6
  *
  * 内核态 cpufreq policy notifier，拦截用户空间频率修改并强制锁定上限。
+ *
+ * v2.6 严重故障修复 (arm 时把几乎所有簇离线掉):
+ *   现象: 设备上启动用户态后，cluster0/1/2 被标记 offline、cap=0kHz，
+ *          只剩 cluster3 在线（靠"至少保留一个簇"的保护才没彻底死机）。
+ *
+ *   根因（v2.3 引入的设计缺陷）: freq_limits_store() 里有
+ *       if (num_clusters == 0) return -ENODEV;      // 拒收写入
+ *   而 disarm 时 scan_state_reset() 会把 num_clusters 清零。于是:
+ *     disarm -> num_clusters=0 -> freq_limits 写入被永久拒绝（实测以 root
+ *     写也失败，且无 SELinux 拒绝）-> 内核侧配置永远是全 0 ->
+ *     再次 arm 时按 "cap==0 = 离线该簇" 的语义把所有簇关掉。
+ *   这个守卫本意是"让用户态看出内核态是死的"，却堵死了唯一能修复状态的
+ *   写入通道，属于典型的鸡生蛋。
+ *
+ *   修复:
+ *     - freq_limits 写入【永远接受】，记录到独立的 configured_limits[]，
+ *       真正应用发生在 soc_scan_and_apply()。不再依赖"先扫描后配置"。
+ *     - scan_state_reset() 不清 configured_limits[]，disarm 不再丢配置。
+ *     - soc_scan_and_apply() 的 cap 优先级: configured_limits[] >
+ *       模块参数 freq_limits[] > 0。builtin 无法用 modprobe 传参，
+ *       配置只能走 sysfs，所以必须以 configured_limits 为准。
+ *     - 安全阀 1: arm_enable() 在没有任何 >0 限额时拒绝 arm。
+ *     - 安全阀 2: cluster_offline() 在没有任何 >0 限额时拒绝离线任何簇。
+ *       即"未配置 != 要求离线"，宁可什么都不做也不按未初始化配置改拓扑。
  *
  * v2.5 用户态门控 (userspace-gated):
  *   核心变化: 内核态默认【完全不生效】，必须由用户态显式 arm 才开始工作；
@@ -192,6 +216,23 @@ static struct delayed_work arm_watchdog_work;
 /* 重新 arm 的节流：防抖，避免用户态高频写 arm 反复触发扫描 */
 #define ARM_REARM_THROTTLE_MS   1000
 
+/* 已记录但尚未应用（或已应用）的 per-cluster 限额。
+ *
+ * 不能用模块参数 freq_limits[] 当存储：参数在 builtin 下无法通过 modprobe
+ * 传值，只能靠 sysfs 写；而 sysfs 写入必须允许在扫描之前发生。
+ * 单独的 configured_limits[] 让"先配限额、后 arm"这个顺序变得可靠。 */
+static int configured_limits[MAX_CLUSTERS] = { 0, 0, 0, 0 };
+
+/* 是否存在至少一个 >0 的限额。全 0 意味着"配置还没到位"，
+ * 此时绝不能按 cap==0 的语义去离线集群。 */
+static bool any_limit_configured(void)
+{
+    for (int i = 0; i < MAX_CLUSTERS; i++)
+        if (configured_limits[i] > 0)
+            return true;
+    return false;
+}
+
 /* 前向声明。
  * 注意 arm_watchdog_start：它被 arm_enable() 调用，但定义在其后，
  * 漏了声明会报 "call to undeclared function"（C99 起不再允许隐式声明）。 */
@@ -242,6 +283,19 @@ static void arm_enable(void)
 {
     if (enforced)
         return;
+
+    /* 前置检查: 没有配置任何 >0 的限额就拒绝生效。
+     *
+     * 这是本模块最危险的一条路径 —— 若在配置全 0 时扫描，每个簇的 cap
+     * 都是 0，而 cap==0 的语义是"离线该簇"，会把几乎所有簇关掉。
+     * 设备上实测触发过（3 个簇被离线，只剩 1 核运行）。
+     * 宁可保持惰性，也绝不按未初始化的配置去改 CPU 拓扑。 */
+    if (!any_limit_configured()) {
+        pr_warn(DRV_NAME ": refusing to arm - no freq limit configured. "
+                         "Write freq_limits first (e.g. "
+                         "echo 2000000,2200000,2600000,2800000 > freq_limits)\n");
+        return;
+    }
 
     soc_scan_and_apply();
 
@@ -332,7 +386,17 @@ static void cluster_offline(struct soc_cluster *c)
     if (c->offlined || c->cap > 0)
         return;
 
-    /* 至少保留一个 cluster 在线 */
+    /* 安全阀 1: 一个 >0 的限额都没有时，说明用户态配置还没到位。
+     * 此时 cap==0 不代表"要求离线"，只代表"还没配"。
+     * 设备上曾因此在 arm 瞬间把 3 个簇离线掉，只剩 1 个核在跑。
+     * 宁可什么都不做，也不能按未初始化的配置去改拓扑。 */
+    if (!any_limit_configured()) {
+        pr_warn(DRV_NAME ": refusing to offline cpu%u - no freq limit configured yet "
+                         "(set freq_limits before arming)\n", c->first_cpu);
+        return;
+    }
+
+    /* 安全阀 2: 至少保留一个 cluster 在线 */
     if (clusters_online <= 1) {
         pr_warn(DRV_NAME ": refusing to offline last cluster (cpu%u)\n",
                 c->first_cpu);
@@ -607,7 +671,11 @@ static void scan_retry_cb(struct work_struct *work)
  * 之后 policy 重算 / 模块卸载时移除它会踩到野指针。
  * 只有 qos_active 为 true 的请求才是"已登记"的，remove 对未登记请求会 WARN。
  *
- * cpumask 是内嵌的，随 memset 一起清零，无需单独释放。 */
+ * cpumask 是内嵌的，随 memset 一起清零，无需单独释放。
+ *
+ * 注意: 不动 configured_limits[]。它是用户态写入的配置，必须在
+ * disarm/重扫之间保持，否则"disarm 后配置丢失 -> 再 arm 时全 0 ->
+ * 把所有簇离线"的故障会复现。 */
 static void scan_state_reset(void)
 {
     int i;
@@ -653,13 +721,19 @@ static void soc_scan_and_apply(void)
 
         clusters[idx].first_cpu = cpu;
         clusters[idx].hw_max    = policy->cpuinfo.max_freq;
-        clusters[idx].cap       = 0;
         clusters[idx].offlined  = false;
 
-        if (idx < num_freq_limits)
+        /* cap 来源优先级: 用户态通过 sysfs 写入的 configured_limits[]
+         * 高于模块参数 freq_limits[]。
+         *
+         * 之所以以 configured_limits 为准: builtin 构建下无法用
+         * modprobe 传参，配置只能走 sysfs；而 sysfs 写入发生在 arm 之前，
+         * 所以扫描时必须以它为准，否则会看到全 0（= 离线全部簇）。 */
+        if (configured_limits[idx] > 0)
+            clusters[idx].cap = (unsigned int)configured_limits[idx];
+        else if (idx < num_freq_limits && freq_limits[idx] > 0)
             clusters[idx].cap = (unsigned int)freq_limits[idx];
-        /* cap < 0 → treat as 0 (offline) */
-        if ((int)clusters[idx].cap < 0)
+        else
             clusters[idx].cap = 0;
 
         clusters_online++;
@@ -787,15 +861,35 @@ static ssize_t active_show(struct kobject *k, struct kobj_attribute *a,
 }
 static struct kobj_attribute attr_active = __ATTR_RO(active);
 
-/* freq_limits (rw) */
+/* freq_limits (rw)
+ *
+ * 重要: 这个入口允许在 num_clusters==0 时写入（只记录，不应用）。
+ *
+ * 早期版本在这里 return -ENODEV 拒绝写入，导致致命的鸡生蛋问题:
+ * disarm 时 scan_state_reset() 会把 num_clusters 清零，此后 freq_limits
+ * 写入被永久拒绝 -> 内核侧配置永远是全 0 -> 再次 arm 时每个簇的 cap 都是 0
+ * -> 按 cap==0 语义把几乎所有簇离线。设备上实测触发了这个故障
+ * （3 个簇被离线，只剩 1 个在跑，靠"至少保留一个簇"的保护才没死）。
+ *
+ * 正确做法: 写入永远被接受并记录到 configured_limits[]，真正应用到集群
+ * 是在 soc_scan_and_apply() 里。这样"先配限额、后 arm"的顺序不再有隐蔽依赖。
+ */
 static ssize_t freq_limits_show(struct kobject *k, struct kobj_attribute *a,
                                  char *buf)
 {
     int pos = 0;
     mutex_lock(&lock);
-    for (int i = 0; i < num_clusters; i++)
-        pos += scnprintf(buf + pos, PAGE_SIZE - pos,
-                         "%s%u", i ? "," : "", clusters[i].cap);
+    if (num_clusters > 0) {
+        /* 已扫描: 显示内核实际在用的 cap */
+        for (int i = 0; i < num_clusters; i++)
+            pos += scnprintf(buf + pos, PAGE_SIZE - pos,
+                             "%s%u", i ? "," : "", clusters[i].cap);
+    } else {
+        /* 未扫描: 显示已记录但尚未应用的配置值 */
+        for (int i = 0; i < MAX_CLUSTERS; i++)
+            pos += scnprintf(buf + pos, PAGE_SIZE - pos,
+                             "%s%d", i ? "," : "", configured_limits[i]);
+    }
     mutex_unlock(&lock);
     pos += scnprintf(buf + pos, PAGE_SIZE - pos, "\n");
     return pos;
@@ -816,17 +910,22 @@ static ssize_t freq_limits_store(struct kobject *k, struct kobj_attribute *a,
     }
     if (n == 0) return -EINVAL;
 
-    /* 内核态一次都没扫到 cluster 时，这里必须明确报错，而不是"接受写入但
-     * 什么都不做"。旧实现静默吞掉写入，用户态完全看不出内核态是死的
-     * （num_clusters==0 时下面那个 for 直接空转）。 */
+    mutex_lock(&lock);
+
+    /* 记录配置。cap<0 按 0（离线）处理，与模块参数语义一致 */
+    for (int i = 0; i < n && i < MAX_CLUSTERS; i++)
+        configured_limits[i] = (vals[i] < 0) ? 0 : vals[i];
+
     if (num_clusters == 0) {
-        pr_warn(DRV_NAME ": freq_limits write ignored - no cluster detected yet\n");
-        return -ENODEV;
+        /* 还没扫描过，只记录。等 arm 时 soc_scan_and_apply() 会用上 */
+        mutex_unlock(&lock);
+        pr_info(DRV_NAME ": freq_limits recorded (not scanned yet): %d values\n", n);
+        return count;
     }
 
-    mutex_lock(&lock);
+    /* 已扫描: 立即应用 */
     for (int i = 0; i < n && i < num_clusters; i++) {
-        unsigned int new_cap = (vals[i] < 0) ? 0 : (unsigned int)vals[i];
+        unsigned int new_cap = (unsigned int)configured_limits[i];
         bool was_online = !clusters[i].offlined;
 
         clusters[i].cap = new_cap;
@@ -970,7 +1069,7 @@ static int __init abk_soc_opt_init(void)
 {
     int ret;
 
-    pr_info(DRV_NAME ": loading v2.5 (userspace-gated)\n");
+    pr_info(DRV_NAME ": loading v2.6 (userspace-gated)\n");
 
     mutex_init(&lock);
 
@@ -1025,4 +1124,4 @@ module_exit(abk_soc_opt_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AppOpt");
 MODULE_DESCRIPTION("ABK SoC power optimization — userspace-gated cpufreq cap + core offlining");
-MODULE_VERSION("2.5");
+MODULE_VERSION("2.6");
