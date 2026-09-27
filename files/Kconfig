@@ -5,7 +5,7 @@
 config ABK_SOC_OPT
 	tristate "ABK SoC power optimization"
 	depends on CPU_FREQ
-	default m
+	default y
 	help
 	  Kernel-side cpufreq capping module.
 	  Uses a cpufreq policy notifier to enforce per-cluster
@@ -15,21 +15,24 @@ config ABK_SOC_OPT
 	  Sysfs control at /sys/kernel/abk_soc_opt/
 	  Works with the AppOpt userspace tool.
 
-	  NOTE ON BUILD MODE:
-	  Prefer M (loadable module) over Y (builtin).
+	  BUILD MODE:
+	  Default is Y (builtin). This matches the project's existing CI
+	  and Kleaf configuration (abk_control is bool/builtin too), and
+	  builtin never goes through modpost, so it cannot hit
+	  "undefined!" errors for symbols the kernel does not export.
 
-	  Built with =y the driver runs at device_initcall time, which on
-	  Qualcomm platforms is *earlier* than qcom-cpufreq-hw finishes
-	  probing. cpufreq_cpu_get() then returns NULL for every CPU, the
-	  cluster scan records num_clusters=0, and the module stays
-	  permanently inert: the sysfs nodes exist and accept writes, but
-	  nothing is ever enforced. It cannot be recovered by reloading,
-	  because a builtin module cannot be unloaded.
+	  The one caveat of builtin is initcall ordering: the driver runs
+	  at device_initcall time, which on Qualcomm platforms is earlier
+	  than qcom-cpufreq-hw finishes probing. cpufreq_cpu_get() then
+	  returns NULL for every CPU and num_clusters stays 0. Since v2.4
+	  the driver self-heals from this: it retries the scan, rescans on
+	  the first CPUFREQ_CREATE_POLICY notification, and exposes
+	  /sys/kernel/abk_soc_opt/scan for a manual rescan.
 
-	  Built with =m the initcall ordering is naturally correct and the
-	  module can be reloaded at will. If you must build it in (=y), the
-	  driver now retries the scan and also rescans on the first
-	  CPUFREQ_CREATE_POLICY notification, so it should recover on its
-	  own -- but =m is still the safer choice.
-
-	  To compile as a module, choose M here.
+	  M (loadable module) is supported too and is easier to debug
+	  (rmmod/modprobe without a reboot), but Kleaf then requires the
+	  .ko to be listed in kernel_aarch64's module_outs attribute or the
+	  build fails with "built but not copied". Enable with:
+	      ABK_SOC_OPT_MODULE=m ./setup.sh
+	  and add to common/BUILD.bazel:
+	      module_outs = ["drivers/abk_soc_opt/abk_soc_opt.ko"]

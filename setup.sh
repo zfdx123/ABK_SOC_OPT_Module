@@ -64,24 +64,70 @@ soc_opt_install_kernel_files() {
   abk_log "kernel files installed at drivers/abk_soc_opt/"
 }
 
+# ------------------------------------------------------------------
+# 构建模式 + module_outs 提示
+# ------------------------------------------------------------------
+#
+# 默认 y（builtin）。理由：
+#   - 本项目历史上一直是 =y（abk_control 也是 bool/builtin），现有 CI 与 Kleaf
+#     配置都按 builtin 验证过，直接可用。
+#   - =y 不经过 modpost，不会碰到 "device_offline undefined" 这类未导出符号问题。
+#   - =y 的代价是 initcall 早于 qcom-cpufreq-hw，可能扫不到 cluster；v2.4 已加
+#     扫描重试 + CPUFREQ_CREATE_POLICY 补扫 + scan sysfs 手动重扫来自愈。
+#
+# 若要可加载模块（.ko，可 rmmod/modprobe 重载，调试更方便）：
+#     ABK_SOC_OPT_MODULE=m ./setup.sh
+# 但 Kleaf 会要求把 .ko 登记进 module_outs，否则构建报：
+#     ERROR: The following kernel modules are built but not copied. Add these lines
+#            to the module_outs attribute of @//common:kernel_aarch64:
+#                "drivers/abk_soc_opt/abk_soc_opt.ko",
+# 这里不做自动改写 BUILD.bazel（容易写坏），只把需要的手动步骤打印出来。
 soc_opt_enable_config() {
-  abk_require_file "$DEFCONFIG"
-  # 构建模式。默认 m（可加载模块）：
-  #   =m 的 initcall 时序天然正确，且可随时 rmmod/modprobe 重新加载；
-  #   =y 会在 device_initcall 阶段运行，早于 qcom-cpufreq-hw probe，
-  #      导致扫不到 cluster（num_clusters=0）而永久失效，且无法重载补救。
-  #   v2.3 已加了扫描重试 + CPUFREQ_CREATE_POLICY 补扫 + scan sysfs 兜底，
-  #   即使 =y 也能自愈，但仍推荐 =m。
-  # 需要 builtin 时：ABK_SOC_OPT_BUILTIN=y ./setup.sh
-  local mode="m"
-  [ "${ABK_SOC_OPT_BUILTIN:-}" = "y" ] && mode="y"
+  local mode="${ABK_SOC_OPT_MODULE:-y}"
 
-  if [ "$mode" = "m" ]; then
-    abk_module_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
-  else
-    abk_enable_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
-  fi
+  abk_require_file "$DEFCONFIG"
+
+  case "$mode" in
+    m)
+      abk_module_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
+      ;;
+    y|"")
+      mode="y"
+      abk_enable_config CONFIG_ABK_SOC_OPT "$DEFCONFIG"
+      ;;
+    *)
+      abk_die "ABK_SOC_OPT_MODULE 只能是 y 或 m，收到: $mode"
+      ;;
+  esac
+
   abk_log "CONFIG_ABK_SOC_OPT=$mode set in $DEFCONFIG"
+}
+
+soc_opt_module_outs_hint() {
+  local common_dir build_file
+
+  common_dir="$(soc_opt_common_dir)"
+  build_file="$common_dir/BUILD.bazel"
+
+  abk_log "---------------------------------------------------------------"
+  abk_log "选择了 =m（可加载模块），Kleaf 需要登记 module_outs，否则会报"
+  abk_log "  'The following kernel modules are built but not copied'"
+  abk_log ""
+  abk_log "请在 $build_file 的 kernel_aarch64 规则里加入："
+  abk_log "    module_outs = ["
+  abk_log "        \"drivers/abk_soc_opt/abk_soc_opt.ko\","
+  abk_log "    ],"
+  abk_log ""
+  abk_log "或安装 buildozer 后执行："
+  abk_log "    buildozer 'add module_outs drivers/abk_soc_opt/abk_soc_opt.ko' \\"
+  abk_log "        @//common:kernel_aarch64"
+  abk_log ""
+  abk_log "不想动 Bazel 配置的话，去掉 ABK_SOC_OPT_MODULE=m 用默认的 =y 即可。"
+  abk_log "---------------------------------------------------------------"
+
+  if [ -f "$build_file" ] && grep -qF 'drivers/abk_soc_opt/abk_soc_opt.ko' "$build_file"; then
+    abk_log "检测到 BUILD.bazel 里已包含该 .ko，无需手动修改。"
+  fi
 }
 
 # ------------------------------------------------------------------
@@ -95,8 +141,12 @@ case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
     ;;
 
   before_build)
-    abk_log "before_build: enabling CONFIG_ABK_SOC_OPT=m"
+    abk_log "before_build: enabling CONFIG_ABK_SOC_OPT (mode=${ABK_SOC_OPT_MODULE:-y})"
+    soc_opt_install_kernel_files
     soc_opt_enable_config
+    if [ "${ABK_SOC_OPT_MODULE:-}" = "m" ]; then
+      soc_opt_module_outs_hint
+    fi
     ;;
 
   *)
